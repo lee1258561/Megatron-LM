@@ -43,7 +43,7 @@ from megatron.core.transformer.residual_recompute import ResidualStreamRecompute
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
 from megatron.core.transformer.torch_norm import LayerNormBuilder
 from megatron.core.transformer.transformer_config import TransformerConfig
-from megatron.core.transformer.transformer_layer_mixins import TransformerLayerTECudaGraphMixin
+from megatron.core.transformer.transformer_layer_mixins import TECudaGraphTransformerLayerMixin
 from megatron.core.transformer.utils import precision_aware_checkpoint
 from megatron.core.typed_torch import apply_module, copy_signature
 from megatron.core.utils import (
@@ -521,7 +521,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
                     and self.config.cuda_graph_impl == "transformer_engine"
                 ):
                     # pylint: disable-next=line-too-long
-                    can_recompute_pre_mlp_layernorm = TransformerLayerTECudaGraphMixin.can_recompute_pre_mlp_layernorm_for_te_cudagraph(
+                    can_recompute_pre_mlp_layernorm = TECudaGraphTransformerLayerMixin.can_recompute_pre_mlp_layernorm_for_te_cudagraph(
                         self.config, self.is_moe_layer
                     )
                 if can_recompute_pre_mlp_layernorm:
@@ -1422,7 +1422,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             mlp_output_with_bias = (mlp_output, mlp_bias)
 
         if self.config.cuda_graph_impl == "transformer_engine" and isinstance(
-            self, TransformerLayerTECudaGraphMixin
+            self, TECudaGraphTransformerLayerMixin
         ):
             cuda_graph_output = self._te_cuda_graph_mlp_capture_output(
                 mlp_output_with_bias, residual
@@ -1866,7 +1866,7 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
         return
 
 
-class TECudaGraphTransformerLayer(TransformerLayerTECudaGraphMixin, TransformerLayer):
+class TECudaGraphTransformerLayer(TECudaGraphTransformerLayerMixin, TransformerLayer):
     """Transformer layer with opt-in TE CUDA graph capture and replay.
 
     ``build_module`` selects this class when ``cuda_graph_impl`` is

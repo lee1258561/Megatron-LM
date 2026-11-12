@@ -61,10 +61,10 @@ class MambaLayerSubmodules:
     sharded_state_dict_keys_map: Dict[str, str] = field(default_factory=dict)
 
 
-class MambaLayerTECudaGraphMixin(TECudaGraphMixin):
+class TECudaGraphMambaLayerMixin(TECudaGraphMixin):
     """Declare the Mamba scope and its TE graph input restrictions."""
 
-    def before_replay_hook(self, hidden_states: Tensor, *args, **kwargs):
+    def _te_cuda_graph_prepare_replay(self, hidden_states: Tensor, *args, **kwargs):
         """Reject inference contexts and prepare Mamba's tensor inputs for replay."""
         if args:
             positional_inputs = signature(self.forward).bind(hidden_states, *args).arguments
@@ -74,15 +74,16 @@ class MambaLayerTECudaGraphMixin(TECudaGraphMixin):
             "CUDA graph accepts only Tensor inputs. inference_context is excluded from input list. "
             "For inference cuda graph, please use cuda_graph_impl=local instead."
         )
-        return super().before_replay_hook(
+        return super()._te_cuda_graph_prepare_replay(
             hidden_states, **{k: v for k, v in kwargs.items() if v is not None}
         )
 
     def is_graphable_for_scope(self, modules):
+        """Return whether the requested TE graph scope includes this Mamba layer."""
         return not modules or CudaGraphModule.mamba in modules
 
 
-class MambaLayer(MambaLayerTECudaGraphMixin, GraphableMegatronModule, TwoStageAttentionLayer):
+class MambaLayer(TECudaGraphMambaLayerMixin, GraphableMegatronModule, TwoStageAttentionLayer):
     """
     A single Mamba layer.
 

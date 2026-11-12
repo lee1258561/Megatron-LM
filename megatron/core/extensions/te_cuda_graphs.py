@@ -71,14 +71,14 @@ def get_te_cuda_graph_module_class(module):
         HyperConnectionTransformerLayer,
     )
     from megatron.core.transformer.transformer_layer_mixins import (
-        HyperConnectionTransformerLayerTECudaGraphMixin,
+        TECudaGraphHyperConnectionTransformerLayerMixin,
     )
 
     bases = (module, TECudaGraphTransformerLayer)
     if issubclass(module, HyperConnectionTransformerLayer):
         bases = (
             module,
-            HyperConnectionTransformerLayerTECudaGraphMixin,
+            TECudaGraphHyperConnectionTransformerLayerMixin,
             TECudaGraphTransformerLayer,
         )
 
@@ -215,16 +215,17 @@ class TECudaGraphMixin:
     Default behavior:
         The whole forward() is one graph with a single tensor input, hidden_states.
         Modules can supply additional tensor inputs, such as masks or rotary embeddings,
-        through their static-input and replay hooks. These inputs pass through the shared
+        through their static-input and replay methods. These inputs pass through the shared
         methods as **kwargs so this mixin does not need each module's argument list.
 
     Graphing only part of the module:
-        Subclasses override these methods (see TransformerLayerTECudaGraphMixin):
+        Subclasses override these methods (see TECudaGraphTransformerLayerMixin):
 
-        before_replay_hook: runs any eager code that comes before the graph, then
+        _te_cuda_graph_capture_forward: runs the selected computation during capture.
+        _te_cuda_graph_prepare_replay: runs any eager code that comes before the graph, then
             returns two callables: one that replays the graph, and one that takes
             the graph outputs and finishes the call.
-        after_replay_hook: the default for that second callable. Runs any eager
+        _te_cuda_graph_finish_replay: the default for that second callable. Runs any eager
             code after the graph and returns what forward() would have returned.
         is_graphable_for_scope / _get_submodules_under_cudagraphs: which
             cuda_graph_modules scopes this module covers and which submodules
@@ -234,7 +235,7 @@ class TECudaGraphMixin:
         Graph inputs must be tensors or None; drop anything else (e.g.
         packed_seq_params, inference_context) before replay.
         Bind state that the after-graph code needs (masks, context, etc.) into
-        the callable returned by before_replay_hook, not onto self, so one
+        the callable returned by _te_cuda_graph_prepare_replay, not onto self, so one
         call's state cannot leak into another.
     """
 
@@ -381,7 +382,7 @@ class TECudaGraphMixin:
         # and overlaps with the H2D transfer on reload stream.
         if record_offload:
             hidden_states = off_interface.backward_record(hidden_states)
-        cuda_graph_outputs = self.capture_forward_hook(hidden_states, *args, **kwargs)
+        cuda_graph_outputs = self._te_cuda_graph_capture_forward(hidden_states, *args, **kwargs)
         # Record the forward event on cuda graph stream for cuda graph capture.
         # This is to ensure the main stream waits for computing on cuda graph stream to complete,
         # and overlaps with the D2H transfer on offloading stream.
@@ -389,13 +390,15 @@ class TECudaGraphMixin:
             off_interface.forward_record()
         return cuda_graph_outputs
 
-    def capture_forward_hook(self, *args, **kwargs):
+    def _te_cuda_graph_capture_forward(self, *args, **kwargs):
         """Capture the entire module by forwarding its inputs to forward()."""
         return self.forward(*args, **kwargs)
 
     def _te_cuda_graph_replay(self, hidden_states: torch.Tensor, *args, **kwargs):
         """Replay the graph and run its continuation with shared offload ordering."""
-        replay_graph, after_replay = self.before_replay_hook(hidden_states, *args, **kwargs)
+        replay_graph, after_replay = self._te_cuda_graph_prepare_replay(
+            hidden_states, *args, **kwargs
+        )
         off_interface = self.get_offload_interface()
         delay_offload_until_cuda_graph = (
             off_interface is not None and self.config.delay_offload_until_cuda_graph
@@ -415,14 +418,14 @@ class TECudaGraphMixin:
             if delay_offload_until_cuda_graph:
                 off_interface.exit_replay()
 
-    def before_replay_hook(self, hidden_states: torch.Tensor, **kwargs):
+    def _te_cuda_graph_prepare_replay(self, hidden_states: torch.Tensor, **kwargs):
         """Bind tensor inputs for graph replay and its eager continuation."""
         return (
             partial(self._te_cuda_graph_replay_graph, hidden_states, **kwargs),
-            self.after_replay_hook,
+            self._te_cuda_graph_finish_replay,
         )
 
-    def after_replay_hook(self, outputs):
+    def _te_cuda_graph_finish_replay(self, outputs):
         """Restore the public forward result; whole-module graphs need no adaptation."""
         return outputs
 

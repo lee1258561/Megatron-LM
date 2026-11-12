@@ -22,7 +22,7 @@ from megatron.core.utils import is_te_min_version, is_torch_min_version, log_sin
 logger = logging.getLogger(__name__)
 
 
-class TransformerLayerTECudaGraphMixin(TECudaGraphMixin):
+class TECudaGraphTransformerLayerMixin(TECudaGraphMixin):
     """Connect TransformerLayer's attention and MLP stages to a single TE graph."""
 
     def register_te_cuda_graph(self):
@@ -410,7 +410,7 @@ class TransformerLayerTECudaGraphMixin(TECudaGraphMixin):
             pad_between_seqs=True,
         )
 
-    def capture_forward_hook(self, hidden_states: Tensor, *args, **kwargs):
+    def _te_cuda_graph_capture_forward(self, hidden_states: Tensor, *args, **kwargs):
         """
         CUDA Graph capture for this layer using TE interface.
         There are some differences from the normal pass:
@@ -467,7 +467,7 @@ class TransformerLayerTECudaGraphMixin(TECudaGraphMixin):
             cuda_graph_outputs.append(context)
         return tuple(cuda_graph_outputs)
 
-    def before_replay_hook(self, hidden_states: Tensor, *args, **kwargs):
+    def _te_cuda_graph_prepare_replay(self, hidden_states: Tensor, *args, **kwargs):
         """Run the eager prefix and bind this call's graph and continuation inputs."""
         if args:
             positional_inputs = (
@@ -525,7 +525,7 @@ class TransformerLayerTECudaGraphMixin(TECudaGraphMixin):
         return (
             partial(self._te_cuda_graph_replay_graph, hidden_states, **kwargs),
             partial(
-                self.after_replay_hook,
+                self._te_cuda_graph_finish_replay,
                 context=context,
                 graph_has_context=kwargs.get("context") is not None,
                 padding_mask=kwargs.get("padding_mask"),
@@ -534,7 +534,7 @@ class TransformerLayerTECudaGraphMixin(TECudaGraphMixin):
             ),
         )
 
-    def after_replay_hook(
+    def _te_cuda_graph_finish_replay(
         self,
         cuda_graph_output,
         *,
@@ -604,7 +604,7 @@ class TransformerLayerTECudaGraphMixin(TECudaGraphMixin):
         return output, context
 
 
-class HyperConnectionTransformerLayerTECudaGraphMixin(TransformerLayerTECudaGraphMixin):
+class TECudaGraphHyperConnectionTransformerLayerMixin(TECudaGraphTransformerLayerMixin):
     """Adapt TE graph inputs and parameter hooks for hyper connection layers."""
 
     def get_layer_static_inputs(self, seq_length, micro_batch_size):

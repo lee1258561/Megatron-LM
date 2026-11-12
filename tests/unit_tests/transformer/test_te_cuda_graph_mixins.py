@@ -27,7 +27,7 @@ from megatron.core.transformer.hyper_connection_transformer_layer import (
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.core.transformer.transformer_layer_mixins import (
-    HyperConnectionTransformerLayerTECudaGraphMixin,
+    TECudaGraphHyperConnectionTransformerLayerMixin,
 )
 
 
@@ -205,11 +205,11 @@ def test_te_cuda_graph_class_serialization():
     assert adapted.__call__ is original.__call__
     assert (
         adapted.get_layer_static_inputs
-        is HyperConnectionTransformerLayerTECudaGraphMixin.get_layer_static_inputs
+        is TECudaGraphHyperConnectionTransformerLayerMixin.get_layer_static_inputs
     )
     assert (
         adapted._get_submodules_under_cudagraphs
-        is HyperConnectionTransformerLayerTECudaGraphMixin._get_submodules_under_cudagraphs
+        is TECudaGraphHyperConnectionTransformerLayerMixin._get_submodules_under_cudagraphs
     )
     assert not hasattr(original, "get_layer_static_inputs")
     assert not hasattr(original, "_get_submodules_under_cudagraphs")
@@ -267,16 +267,16 @@ def test_te_cuda_graph_mixin_hooks(monkeypatch, failure):
     )
 
     class Adapter(_Module):
-        def capture_forward_hook(self, hidden_states, offset=1):
+        def _te_cuda_graph_capture_forward(self, hidden_states, offset=1):
             record("capture")
             return self.forward(hidden_states) + offset
 
-        def before_replay_hook(self, hidden_states):
+        def _te_cuda_graph_prepare_replay(self, hidden_states):
             record("before")
-            replay_graph, _ = super().before_replay_hook(hidden_states + 1)
-            return replay_graph, partial(self.after_replay_hook, residual=hidden_states)
+            replay_graph, _ = super()._te_cuda_graph_prepare_replay(hidden_states + 1)
+            return replay_graph, partial(self._te_cuda_graph_finish_replay, residual=hidden_states)
 
-        def after_replay_hook(self, outputs, residual):
+        def _te_cuda_graph_finish_replay(self, outputs, residual):
             record("after")
             return outputs + residual
 
