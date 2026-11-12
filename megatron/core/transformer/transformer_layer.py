@@ -576,7 +576,12 @@ class TransformerLayer(GraphableMegatronModule, BaseTransformerLayer, TwoStageAt
             "Module must be fully constructed (config set) before calling "
             "`init_backward_dw_wrapper`."
         )
-        self.backward_dw_wrapper = _BackwardDWWrapper(self)
+        if config.cuda_graph_impl == "transformer_engine":
+            from megatron.core.models.common.utils import _TECudaGraphBackwardDWWrapper
+
+            self.backward_dw_wrapper = _TECudaGraphBackwardDWWrapper(self)
+        else:
+            self.backward_dw_wrapper = _BackwardDWWrapper(self)
 
     def get_inner_quantization_context(self) -> AbstractContextManager:
         """Return the quantization context for fine-grained layer execution."""

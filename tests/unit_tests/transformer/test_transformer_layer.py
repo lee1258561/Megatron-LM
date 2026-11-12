@@ -836,7 +836,7 @@ class TestTransformerLayerWithHyperConnectionRecompute:
 
         assert layer.is_moe_layer
         assert not hasattr(layer, "cudagraph_manager")
-        assert layer.mlp_hyper_connection not in layer._get_submodules_under_cudagraphs()
+        assert not hasattr(layer, "_get_submodules_under_cudagraphs")
 
     @pytest.mark.parametrize(
         "cuda_graph_module",

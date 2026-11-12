@@ -1851,14 +1851,14 @@ class TEMoECudaGraphPartialCaptureSignal(Exception):
                 if isinstance(attr, torch.Tensor):
                     outputs.append(attr)
                     valid_cudagraph_attrs.append(attr_name)
-            if self.moe_layer.token_dispatcher.valid_cudagraph_attrs is None:
-                self.moe_layer.token_dispatcher.valid_cudagraph_attrs = valid_cudagraph_attrs
+            dispatcher = self.moe_layer.token_dispatcher
+            attrs_by_dispatcher = self.moe_layer.te_cuda_graph_valid_dispatcher_attrs
+            if dispatcher not in attrs_by_dispatcher:
+                attrs_by_dispatcher[dispatcher] = valid_cudagraph_attrs
             else:
-                assert (
-                    self.moe_layer.token_dispatcher.valid_cudagraph_attrs == valid_cudagraph_attrs
-                ), (
+                assert attrs_by_dispatcher[dispatcher] == valid_cudagraph_attrs, (
                     "valid_cudagraph_attrs mismatch: "
-                    f"{self.moe_layer.token_dispatcher.valid_cudagraph_attrs} != "
+                    f"{attrs_by_dispatcher[dispatcher]} != "
                     f"{valid_cudagraph_attrs}"
                 )
         # Also return the shared expert output, if it is not None.

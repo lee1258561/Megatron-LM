@@ -26,6 +26,9 @@ from megatron.core.transformer.hyper_connection_transformer_layer import (
 )
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec
+from megatron.core.transformer.transformer_layer_mixins import (
+    HyperConnectionTransformerLayerTECudaGraphMixin,
+)
 
 
 def _config(backend="transformer_engine"):
@@ -200,7 +203,16 @@ def test_te_cuda_graph_class_serialization():
     assert get_te_cuda_graph_module_class(_Module) is _Module
     assert get_te_cuda_graph_module_class(MegatronModule) is MegatronModule
     assert adapted.__call__ is original.__call__
-    assert adapted.get_layer_static_inputs is original.get_layer_static_inputs
+    assert (
+        adapted.get_layer_static_inputs
+        is HyperConnectionTransformerLayerTECudaGraphMixin.get_layer_static_inputs
+    )
+    assert (
+        adapted._get_submodules_under_cudagraphs
+        is HyperConnectionTransformerLayerTECudaGraphMixin._get_submodules_under_cudagraphs
+    )
+    assert not hasattr(original, "get_layer_static_inputs")
+    assert not hasattr(original, "_get_submodules_under_cudagraphs")
     assert original.__bases__ == original_bases and spec.module is original
     payload = pickle.dumps(adapted)
     assert pickle.loads(payload) is adapted
@@ -245,6 +257,8 @@ def test_te_cuda_graph_mixin_hooks(monkeypatch, failure):
         return hidden_states
 
     offload = SimpleNamespace(
+        cuda_graph_stream=Mock(),
+        cuda_graph_event=Mock(),
         backward_record=backward_record,
         forward_record=lambda: record("forward"),
         enter_replay=lambda: record("enter"),
@@ -271,6 +285,7 @@ def test_te_cuda_graph_mixin_hooks(monkeypatch, failure):
 
     module = Adapter(_config())
     module.offload_module_in_cuda_graph = True
+    module.config.fine_grained_activation_offloading = True
     module.config.delay_offload_until_cuda_graph = True
     monkeypatch.setattr(cuda_graphs, "_IS_GRAPH_CAPTURING", True)
     for capture in (
@@ -282,7 +297,9 @@ def test_te_cuda_graph_mixin_hooks(monkeypatch, failure):
         torch.testing.assert_close(capture(), torch.tensor(7.0))
         assert events == ["backward", "capture", "forward"]
 
-    def graph(hidden_states, is_first_microbatch):
+    def graph(hidden_states, is_first_microbatch, cuda_graph_stream, cuda_graph_event):
+        assert cuda_graph_stream is offload.cuda_graph_stream.return_value
+        assert cuda_graph_event is offload.cuda_graph_event.return_value
         record("graph")
         return hidden_states * module.weight + 1
 

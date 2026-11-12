@@ -256,6 +256,8 @@ class TEPartialCaptureMoEMixin:
         if self.config.cuda_graph_impl == "transformer_engine":
             # Cudagraph tensor store for resuming the forward pass from the end of the cudagraph.
             self.te_cuda_graph_tensor_store = TEMoECudaGraphTensorStore()
+            # Keep capture validation separate for each training/inference dispatcher.
+            self.te_cuda_graph_valid_dispatcher_attrs = {}
             if {CudaGraphModule.moe_router, CudaGraphModule.moe_preprocess} & set(
                 self.config.cuda_graph_modules
             ):
@@ -278,7 +280,9 @@ class TEPartialCaptureMoEMixin:
         if CudaGraphModule.moe_preprocess in self.config.cuda_graph_modules:
             # CUDA graph output is [hidden_states, probs] + attributes outputs.
             (hidden_states, probs), attr_outputs = cuda_graph_output[:2], cuda_graph_output[2:]
-            valid_cudagraph_attrs = self.token_dispatcher.valid_cudagraph_attrs
+            valid_cudagraph_attrs = self.te_cuda_graph_valid_dispatcher_attrs.get(
+                self.token_dispatcher
+            )
             assert len(attr_outputs) == len(
                 valid_cudagraph_attrs
             ), f"attr_outputs: {len(attr_outputs)} != {len(valid_cudagraph_attrs)}"

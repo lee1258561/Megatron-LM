@@ -6,10 +6,46 @@ from __future__ import annotations
 
 from functools import lru_cache, partial
 from importlib import import_module
+from weakref import WeakKeyDictionary, proxy
 
 import torch
 
+from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.utils import get_attr_wrapped_model
+
+
+class _TECudaGraphBackwardDWWrapperMixin:
+    """Skip captured eager weight gradients and replay the TE backward graph."""
+
+    def __init__(self, layer) -> None:
+        if layer.config.cuda_graph_impl == "transformer_engine":
+            assert isinstance(
+                layer, TECudaGraphMixin
+            ), "TE cuda graphed ep overlap requires TECudaGraphMixin."
+        super().__init__(layer)
+        self.graphed_backward_dw_callable = None
+        self.cuda_graph_modules = layer.config.cuda_graph_modules
+
+    def backward_dw(self):
+        """Run eager or graphed backward wgrad callables for the wrapped layer."""
+        is_replay = (
+            self.layer.config.cuda_graph_impl == "transformer_engine"
+            and hasattr(self.layer, 'te_cuda_graphs')
+            and self.layer.te_cuda_graphs
+        )
+        if self.shared_expert_dw_callable is not None and (
+            not is_replay or CudaGraphModule.moe_router not in self.cuda_graph_modules
+        ):
+            self.shared_expert_dw_callable()
+        if not is_replay or CudaGraphModule.attn not in self.cuda_graph_modules:
+            self.attn_dw_callable()
+        if is_replay and self.graphed_backward_dw_callable is not None:
+            self.graphed_backward_dw_callable()
+        self.layer = None
+
+    def set_graphed_backward_dw_callable(self, graphed_backward_dw_callable):
+        """Plug the cuda-graph backward wgrad replay callable."""
+        self.graphed_backward_dw_callable = graphed_backward_dw_callable
 
 
 @lru_cache(maxsize=None)
@@ -31,6 +67,21 @@ def get_te_cuda_graph_module_class(module):
     if module is TransformerLayer:
         return TECudaGraphTransformerLayer
 
+    from megatron.core.transformer.hyper_connection_transformer_layer import (
+        HyperConnectionTransformerLayer,
+    )
+    from megatron.core.transformer.transformer_layer_mixins import (
+        HyperConnectionTransformerLayerTECudaGraphMixin,
+    )
+
+    bases = (module, TECudaGraphTransformerLayer)
+    if issubclass(module, HyperConnectionTransformerLayer):
+        bases = (
+            module,
+            HyperConnectionTransformerLayerTECudaGraphMixin,
+            TECudaGraphTransformerLayer,
+        )
+
     # Keep the original subclass before the TE adapter so its __call__, input
     # preparation, and forward overrides retain precedence in the MRO.
     # Encode the original import path for reconstruction by pickle in another
@@ -40,9 +91,7 @@ def get_te_cuda_graph_module_class(module):
         f"{module.__qualname__.encode().hex()}"
     )
     return type(
-        f"TECudaGraph{module.__name__}",
-        (module, TECudaGraphTransformerLayer),
-        {"__module__": __name__, "__qualname__": qualname},
+        f"TECudaGraph{module.__name__}", bases, {"__module__": __name__, "__qualname__": qualname}
     )
 
 
@@ -56,6 +105,94 @@ def __getattr__(name):
     for component in bytes.fromhex(class_path).decode().split("."):
         module = getattr(module, component)
     return get_te_cuda_graph_module_class(module)
+
+
+class TECudaGraphOffloadingInterface:
+    """Coordinate TE graph execution with the current activation offload manager."""
+
+    _instances = WeakKeyDictionary()
+
+    @classmethod
+    def get_instance(cls):
+        """Share graph resources across layers for the lifetime of the offload manager."""
+        from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
+            PipelineOffloadManager,
+        )
+
+        manager = PipelineOffloadManager.get_instance()
+        if manager not in cls._instances:
+            cls._instances[manager] = cls(manager)
+        return cls._instances[manager]
+
+    def __init__(self, manager) -> None:
+        # Do not keep a replaced manager (and its offloaded tensors) alive through the cache.
+        self._manager = proxy(manager)
+        # TE CUDA graph offload paths need a stream/event pair that lives outside
+        # individual layer objects so capture, replay, and backward hooks order
+        # the same D2H/H2D work with the same synchronization primitives.
+        self._cuda_graph_stream = torch.cuda.Stream()
+        self._cuda_graph_event = torch.cuda.Event(external=True)
+
+    def cuda_graph_stream(self):
+        """Get the CUDA graph stream."""
+        return self._cuda_graph_stream
+
+    def cuda_graph_event(self):
+        """Get the CUDA graph event."""
+        return self._cuda_graph_event
+
+    def forward_record(self) -> None:
+        """Record the forward event for cuda graph capture."""
+        mgr = self._manager
+        torch.cuda.current_stream().record_event(self._cuda_graph_event)
+        torch.cuda.current_stream().wait_stream(mgr.d2h_stream)
+
+    @staticmethod
+    def backward_record(tensor) -> torch.Tensor:
+        """Insert TE graph synchronization with activation reloads in backward."""
+        return TECudaGraphBackwardReloadSyncFunction.apply(tensor)
+
+    def flush_delayed_groups(self):
+        """Flush the delayed groups."""
+        self._manager.flush_delayed_groups()
+
+    def enter_replay(self):
+        """Enter CUDA graph replay mode to enable delayed offloading."""
+        self._manager.defer_group_commits = True
+
+    def exit_replay(self):
+        """Exit CUDA graph replay mode."""
+        self._manager.defer_group_commits = False
+
+
+class TECudaGraphBackwardReloadSyncFunction(torch.autograd.Function):
+    """Synchronize TE CUDA graph backward with activation reloads.
+
+    Forward is an identity. Backward records the graph synchronization event
+    and waits for the offload manager's H2D stream before passing gradients through.
+    """
+
+    @staticmethod
+    def forward(ctx, tensor) -> torch.Tensor:
+        """Forward pass for cuda graph capture."""
+        from megatron.core.pipeline_parallel.fine_grained_activation_offload import debug_rank
+
+        debug_rank("TECudaGraphBackwardReloadSyncFunction forward")
+        return tensor
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        """Record the backward event and wait for the h2d stream on cuda graph stream."""
+        from megatron.core.pipeline_parallel.fine_grained_activation_offload import debug_rank
+
+        debug_rank("TECudaGraphBackwardReloadSyncFunction backward")
+        off_interface = TECudaGraphOffloadingInterface.get_instance()
+        mgr = off_interface._manager
+        # This event connects TE's graph stream with the reload stream so
+        # backward consumers do not race H2D reloads launched outside the graph.
+        torch.cuda.current_stream().record_event(off_interface.cuda_graph_event())
+        torch.cuda.current_stream().wait_stream(mgr.h2d_stream)
+        return (grad_output,)
 
 
 class TECudaGraphMixin:
@@ -315,9 +452,7 @@ class TECudaGraphMixin:
         if self.config.fine_grained_activation_offloading and getattr(
             self, 'offload_module_in_cuda_graph', False
         ):
-            from megatron.core.pipeline_parallel.fine_grained_activation_offload import (
-                FineGrainedActivationOffloadingInterface as off_interface,
-            )
+            off_interface = self.get_offload_interface()
 
             # TE captures/replays the module on its own graph stream. Passing the
             # offload stream/event in lets TE order graph compute with D2H/H2D

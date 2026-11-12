@@ -11,7 +11,7 @@ from typing import Optional
 import torch
 from torch import Tensor
 
-from megatron.core.extensions.te_cuda_graphs import TECudaGraphMixin
+from megatron.core.extensions.te_cuda_graphs import TECudaGraphMixin, TECudaGraphOffloadingInterface
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.identity_op import IdentityOp
@@ -36,6 +36,8 @@ class TransformerLayerTECudaGraphMixin(TECudaGraphMixin):
 
         # Check the compatibility of fine-grained activation offloading and cuda graph.
         if self.config.fine_grained_activation_offloading:
+            # Allocate the shared graph stream/event before capture starts.
+            self.get_offload_interface()
             cuda_graph_modules = self.config.cuda_graph_modules or []
             if CudaGraphModule.attn in cuda_graph_modules:
                 self.offload_attn_norm = False
@@ -359,7 +361,9 @@ class TransformerLayerTECudaGraphMixin(TECudaGraphMixin):
         return None
 
     def get_offload_interface(self):
-        return self.off_interface
+        if self.config.fine_grained_activation_offloading:
+            return TECudaGraphOffloadingInterface.get_instance()
+        return None
 
     def _get_submodules_under_cudagraphs(self):
         """
@@ -603,3 +607,44 @@ class TransformerLayerTECudaGraphMixin(TECudaGraphMixin):
                 packed_seq_params=packed_seq_params,
             )
         return output, context
+
+
+class HyperConnectionTransformerLayerTECudaGraphMixin(TransformerLayerTECudaGraphMixin):
+    """Adapt TE graph inputs and parameter hooks for hyper connection layers."""
+
+    def get_layer_static_inputs(self, seq_length, micro_batch_size):
+        """Override to produce n-stream hidden_states of shape [s, b, n*C].
+
+        CUDA graph capture creates static buffers whose shapes are determined by
+        this method. The base class returns [s, b, C], but mHC layers operate on
+        n-stream hidden states of shape [s, b, n*C].
+        """
+        static_inputs = super().get_layer_static_inputs(seq_length, micro_batch_size)
+        hs = static_inputs["hidden_states"]
+        n = self.config.mhc_num_residual_streams
+        static_inputs["hidden_states"] = torch.ones(
+            (hs.shape[0], hs.shape[1], n * self.config.hidden_size),
+            dtype=hs.dtype,
+            requires_grad=hs.requires_grad,
+            device=hs.device,
+        )
+        return static_inputs
+
+    def _get_submodules_under_cudagraphs(self):
+        """Override to include hyper connection modules.
+
+        The base TransformerLayer._get_submodules_under_cudagraphs does not include
+        self_attention_hyper_connection / mlp_hyper_connection. Their learnable
+        parameters (mapping_proj, alpha_*, bias) need manual pre-forward hooks
+        during CUDA graph replay so that parameter all-gathers are triggered.
+        """
+        submodules = super()._get_submodules_under_cudagraphs()
+
+        if not self.config.cuda_graph_modules:
+            return submodules
+
+        if CudaGraphModule.attn in self.config.cuda_graph_modules:
+            submodules.append(self.self_attention_hyper_connection)
+        if CudaGraphModule.mlp in self.config.cuda_graph_modules and not self.is_moe_layer:
+            submodules.append(self.mlp_hyper_connection)
+        return submodules
