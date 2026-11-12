@@ -261,6 +261,9 @@ class TECudaGraphMixin:
         # all-gather overlap with forward compute.
         self.te_cuda_graph_manual_hooks = []
         self.te_cuda_graph_current_microbatch = 0
+        if self.config.fine_grained_activation_offloading:
+            # Allocate the shared graph stream/event before capture starts.
+            self.get_offload_interface()
         return self
 
     def __call__(self, *args, **kwargs):
@@ -370,7 +373,9 @@ class TECudaGraphMixin:
     def _te_cuda_graph_capture(self, hidden_states: torch.Tensor, *args, **kwargs):
         """Capture the selected computation, including its offload dependencies."""
         off_interface = self.get_offload_interface()
-        record_offload = off_interface is not None and self.offload_module_in_cuda_graph
+        record_offload = off_interface is not None and getattr(
+            self, 'offload_module_in_cuda_graph', False
+        )
         # Record the backward event on cuda graph stream in backward pass.
         # This is to ensure the main stream waits for computing on cuda graph stream to complete,
         # and overlaps with the H2D transfer on reload stream.
@@ -422,7 +427,9 @@ class TECudaGraphMixin:
         return outputs
 
     def get_offload_interface(self):
-        """Return the offload interface for modules that coordinate it with TE graphs."""
+        """Return the shared TE graph offload interface when activation offloading is enabled."""
+        if self.config.fine_grained_activation_offloading:
+            return TECudaGraphOffloadingInterface.get_instance()
         return None
 
     def _te_cuda_graph_replay_graph(self, hidden_states: torch.Tensor, **kwargs):

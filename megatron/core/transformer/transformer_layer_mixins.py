@@ -11,7 +11,7 @@ from typing import Optional
 import torch
 from torch import Tensor
 
-from megatron.core.extensions.te_cuda_graphs import TECudaGraphMixin, TECudaGraphOffloadingInterface
+from megatron.core.extensions.te_cuda_graphs import TECudaGraphMixin
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.enums import CudaGraphModule
 from megatron.core.transformer.identity_op import IdentityOp
@@ -26,6 +26,7 @@ class TransformerLayerTECudaGraphMixin(TECudaGraphMixin):
     """Connect TransformerLayer's attention and MLP stages to a single TE graph."""
 
     def register_te_cuda_graph(self):
+        """Initialize Transformer graph state and validate its activation offload scopes."""
         super().register_te_cuda_graph()
         # Batch-first shape of the padding_mask this layer received in eager execution (the
         # cuda_graph_warmup_steps), recorded in _forward_attention before any MLP chunking.
@@ -36,8 +37,6 @@ class TransformerLayerTECudaGraphMixin(TECudaGraphMixin):
 
         # Check the compatibility of fine-grained activation offloading and cuda graph.
         if self.config.fine_grained_activation_offloading:
-            # Allocate the shared graph stream/event before capture starts.
-            self.get_offload_interface()
             cuda_graph_modules = self.config.cuda_graph_modules or []
             if CudaGraphModule.attn in cuda_graph_modules:
                 self.offload_attn_norm = False
@@ -306,6 +305,7 @@ class TransformerLayerTECudaGraphMixin(TECudaGraphMixin):
         return tuple(cudagraph_args), cudagraph_kwargs
 
     def is_graphable_for_scope(self, modules):
+        """Return whether this layer contains a requested TE graph scope."""
         # If cuda_graph_modules is not set, every layer is graphed.
         if not modules:
             return True
@@ -358,11 +358,6 @@ class TransformerLayerTECudaGraphMixin(TECudaGraphMixin):
                     self.pre_mlp_norm_checkpoint.discard_output_and_register_recompute(tensor)
             return list(mlp_output_with_bias) + [residual]
 
-        return None
-
-    def get_offload_interface(self):
-        if self.config.fine_grained_activation_offloading:
-            return TECudaGraphOffloadingInterface.get_instance()
         return None
 
     def _get_submodules_under_cudagraphs(self):
